@@ -1,0 +1,1556 @@
+/*
+  ============================================================
+       INTEGRATED ESP32 BATTERY MANAGEMENT SYSTEM
+  ============================================================
+
+  TASK 1 - Adaptive Multi-Cell Battery Intelligence Engine
+  TASK 2 - Event-Driven Safety Protection Kernel
+  TASK 3 - Intelligent Embedded HMI & Diagnostic Interface
+  TASK 4 - Fault-Tolerant Embedded Runtime System
+  TASK 5 - Intelligent Cloud Telemetry Architecture
+  TASK 6 - Executive Battery Intelligence Dashboard
+
+  Hardware:
+  ESP32 DevKit
+  4 potentiometers = 4 simulated battery cells
+  16x2 I2C LCD
+  Relay
+  Buzzer
+  3 LEDs
+  Buttons
+
+  IMPORTANT:
+  This is a Wokwi prototype. Potentiometers simulate
+  cell-voltage sensor inputs.
+
+  NO delay() is used.
+  ============================================================
+*/
+
+#define BLYNK_TEMPLATE_ID "YOUR_TEMPLATE_ID"
+#define BLYNK_TEMPLATE_NAME "ESP32 Battery BMS"
+#define BLYNK_AUTH_TOKEN "YOUR_BLYNK_TOKEN"
+
+#include <Arduino.h>
+#include <Wire.h>
+#include <LiquidCrystal_I2C.h>
+#include <WiFi.h>
+#include <BlynkSimpleEsp32.h>
+
+/* ============================================================
+   PIN CONFIGURATION
+   ============================================================ */
+
+const uint8_t CELL1_PIN = 34;
+const uint8_t CELL2_PIN = 35;
+const uint8_t CELL3_PIN = 32;
+const uint8_t CELL4_PIN = 33;
+
+const uint8_t BUZZER_PIN = 14;
+const uint8_t RELAY_PIN = 13;
+
+const uint8_t RED_LED_PIN = 25;
+const uint8_t YELLOW_LED_PIN = 26;
+const uint8_t GREEN_LED_PIN = 27;
+
+const uint8_t SCREEN_BUTTON_PIN = 18;
+const uint8_t RELAY_FEEDBACK_PIN = 19;
+const uint8_t FAULT_BUTTON_PIN = 23;
+
+/* ============================================================
+   LCD
+   ============================================================ */
+
+LiquidCrystal_I2C lcd(0x27, 16, 2);
+
+/* ============================================================
+   WIFI
+   ============================================================ */
+
+const char WIFI_SSID[] = "Wokwi-GUEST";
+const char WIFI_PASS[] = "";
+
+/* ============================================================
+   BATTERY LIMITS
+   ============================================================ */
+
+const float CELL_MIN_V = 2.50;
+const float CELL_MAX_V = 4.20;
+
+const float UNDER_VOLTAGE = 2.80;
+const float OVER_VOLTAGE = 4.15;
+
+const float MINOR_IMBALANCE = 3.0;
+const float CRITICAL_IMBALANCE = 10.0;
+
+const float MAX_DVDT = 0.15;
+
+/* ============================================================
+   TIMING
+   ============================================================ */
+
+const unsigned long SENSOR_PERIOD = 100;
+const unsigned long SAFETY_PERIOD = 100;
+const unsigned long HMI_PERIOD = 100;
+
+const unsigned long SCREEN_PERIOD = 4000;
+
+const unsigned long TELEMETRY_PERIOD = 2000;
+const unsigned long HISTORY_PERIOD = 5000;
+
+const unsigned long WIFI_RETRY_PERIOD = 10000;
+
+const unsigned long FAULT_DEBOUNCE = 500;
+const unsigned long COOLDOWN_PERIOD = 3000;
+const unsigned long RELAY_GUARD_PERIOD = 2000;
+
+const unsigned long ADC_FREEZE_PERIOD = 3000;
+
+/* ============================================================
+   BATTERY DATA
+   ============================================================ */
+
+float cellVoltage[4] = {
+  3.70, 3.70, 3.70, 3.70
+};
+
+float previousVoltage[4] = {
+  3.70, 3.70, 3.70, 3.70
+};
+
+unsigned long lastADCChange[4] = {
+  0, 0, 0, 0
+};
+
+float packVoltage = 14.8;
+float averageVoltage = 3.70;
+
+float deltaVoltage = 0.0;
+float imbalancePercent = 0.0;
+
+int weakestCell = 0;
+int strongestCell = 0;
+
+int soc = 71;
+
+/* ============================================================
+   STATES
+   ============================================================ */
+
+enum BatteryHealth {
+  HEALTHY,
+  MINOR_IMBALANCE_STATE,
+  CRITICAL_IMBALANCE_STATE,
+  PACK_FAILURE_STATE
+};
+
+BatteryHealth batteryHealth = HEALTHY;
+
+
+enum SafetyState {
+  SAFETY_NORMAL,
+  SAFETY_FAULT,
+  SAFETY_COOLDOWN
+};
+
+SafetyState safetyState = SAFETY_NORMAL;
+
+
+enum RuntimeState {
+  RUNTIME_NORMAL,
+  RUNTIME_DEGRADED,
+  RUNTIME_FAILSAFE,
+  RUNTIME_SHUTDOWN
+};
+
+RuntimeState runtimeState = RUNTIME_NORMAL;
+
+
+enum FaultType {
+  NO_FAULT,
+  UV_FAULT,
+  OV_FAULT,
+  RAPID_CHANGE_FAULT,
+  SENSOR_INVALID_FAULT,
+  SENSOR_FROZEN_FAULT,
+  RELAY_MISMATCH_FAULT
+};
+
+FaultType activeFault = NO_FAULT;
+
+/* ============================================================
+   TIMERS
+   ============================================================ */
+
+unsigned long lastSensor = 0;
+unsigned long lastSafety = 0;
+unsigned long lastHMI = 0;
+unsigned long lastScreen = 0;
+unsigned long lastTelemetry = 0;
+unsigned long lastHistory = 0;
+unsigned long lastWiFiAttempt = 0;
+
+unsigned long faultCandidateStart = 0;
+unsigned long cooldownStart = 0;
+unsigned long lastRelayTransition = 0;
+
+/* ============================================================
+   RELAY
+   ============================================================ */
+
+bool relayCommand = false;
+
+/* ============================================================
+   HMI
+   ============================================================ */
+
+uint8_t currentScreen = 0;
+
+String previousLine1 = "";
+String previousLine2 = "";
+
+/* ============================================================
+   BUZZER
+   ============================================================ */
+
+unsigned long lastBuzzerToggle = 0;
+bool buzzerState = false;
+
+/* ============================================================
+   EVENT QUEUE
+   ============================================================ */
+
+struct EventRecord {
+  unsigned long timestamp;
+  String text;
+};
+
+const uint8_t EVENT_QUEUE_SIZE = 20;
+
+EventRecord eventQueue[EVENT_QUEUE_SIZE];
+
+uint8_t eventHead = 0;
+uint8_t eventTail = 0;
+uint8_t eventCount = 0;
+
+/* ============================================================
+   FAULT LOG
+   ============================================================ */
+
+struct FaultRecord {
+  unsigned long timestamp;
+  FaultType type;
+  String text;
+};
+
+const uint8_t FAULT_LOG_SIZE = 20;
+
+FaultRecord faultLog[FAULT_LOG_SIZE];
+
+uint8_t faultLogIndex = 0;
+
+/* ============================================================
+   UTILITY
+   ============================================================ */
+
+String healthString() {
+
+  switch (batteryHealth) {
+
+    case HEALTHY:
+      return "HEALTHY";
+
+    case MINOR_IMBALANCE_STATE:
+      return "MINOR";
+
+    case CRITICAL_IMBALANCE_STATE:
+      return "CRITICAL";
+
+    case PACK_FAILURE_STATE:
+      return "FAILURE";
+  }
+
+  return "UNKNOWN";
+}
+
+
+String runtimeString() {
+
+  switch (runtimeState) {
+
+    case RUNTIME_NORMAL:
+      return "NORMAL";
+
+    case RUNTIME_DEGRADED:
+      return "DEGRADED";
+
+    case RUNTIME_FAILSAFE:
+      return "FAILSAFE";
+
+    case RUNTIME_SHUTDOWN:
+      return "SHUTDOWN";
+  }
+
+  return "UNKNOWN";
+}
+
+
+String faultString(FaultType type) {
+
+  switch (type) {
+
+    case UV_FAULT:
+      return "UNDERVOLTAGE";
+
+    case OV_FAULT:
+      return "OVERVOLTAGE";
+
+    case RAPID_CHANGE_FAULT:
+      return "RAPID DV/DT";
+
+    case SENSOR_INVALID_FAULT:
+      return "SENSOR INVALID";
+
+    case SENSOR_FROZEN_FAULT:
+      return "ADC FROZEN";
+
+    case RELAY_MISMATCH_FAULT:
+      return "RELAY MISMATCH";
+
+    default:
+      return "NONE";
+  }
+}
+
+/* ============================================================
+   TASK 1
+   ADC READING
+   ============================================================ */
+
+float readCell(uint8_t pin) {
+
+  uint32_t total = 0;
+
+  for (uint8_t i = 0; i < 8; i++) {
+
+    total += analogRead(pin);
+  }
+
+  float adc = total / 8.0;
+
+  /*
+    Wokwi simulation mapping:
+
+    ADC 0    -> 2.50 V
+    ADC 4095 -> 4.20 V
+  */
+
+  return CELL_MIN_V +
+         (adc / 4095.0) *
+         (CELL_MAX_V - CELL_MIN_V);
+}
+
+/* ============================================================
+   TASK 1
+   SOC
+   ============================================================ */
+
+int calculateSOC(float voltage) {
+
+  float result =
+    ((voltage - CELL_MIN_V) /
+     (CELL_MAX_V - CELL_MIN_V)) * 100.0;
+
+  result = constrain(result, 0, 100);
+
+  return (int)result;
+}
+
+/* ============================================================
+   TASK 1
+   BATTERY ANALYTICS
+   ============================================================ */
+
+void updateBatteryAnalytics() {
+
+  const uint8_t pins[4] = {
+    CELL1_PIN,
+    CELL2_PIN,
+    CELL3_PIN,
+    CELL4_PIN
+  };
+
+  unsigned long now = millis();
+
+  for (uint8_t i = 0; i < 4; i++) {
+
+    float newVoltage = readCell(pins[i]);
+
+    previousVoltage[i] = cellVoltage[i];
+
+    if (fabs(newVoltage - cellVoltage[i]) > 0.005) {
+      lastADCChange[i] = now;
+    }
+
+    cellVoltage[i] = newVoltage;
+  }
+
+
+  packVoltage = 0;
+
+  for (uint8_t i = 0; i < 4; i++) {
+    packVoltage += cellVoltage[i];
+  }
+
+  averageVoltage = packVoltage / 4.0;
+
+
+  weakestCell = 0;
+  strongestCell = 0;
+
+  for (uint8_t i = 1; i < 4; i++) {
+
+    if (cellVoltage[i] < cellVoltage[weakestCell])
+      weakestCell = i;
+
+    if (cellVoltage[i] > cellVoltage[strongestCell])
+      strongestCell = i;
+  }
+
+
+  deltaVoltage =
+    cellVoltage[strongestCell] -
+    cellVoltage[weakestCell];
+
+
+  if (averageVoltage > 0) {
+
+    imbalancePercent =
+      (deltaVoltage / averageVoltage) * 100.0;
+  }
+
+
+  soc = calculateSOC(averageVoltage);
+
+
+  if (cellVoltage[weakestCell] < UNDER_VOLTAGE ||
+      cellVoltage[strongestCell] > OVER_VOLTAGE) {
+
+    batteryHealth = PACK_FAILURE_STATE;
+  }
+
+  else if (imbalancePercent > CRITICAL_IMBALANCE) {
+
+    batteryHealth = CRITICAL_IMBALANCE_STATE;
+  }
+
+  else if (imbalancePercent > MINOR_IMBALANCE) {
+
+    batteryHealth = MINOR_IMBALANCE_STATE;
+  }
+
+  else {
+
+    batteryHealth = HEALTHY;
+  }
+}
+
+/* ============================================================
+   TASK 4
+   SENSOR VALIDATION
+   ============================================================ */
+
+bool sensorValid() {
+
+  for (uint8_t i = 0; i < 4; i++) {
+
+    if (cellVoltage[i] < 2.0 ||
+        cellVoltage[i] > 4.5) {
+
+      return false;
+    }
+  }
+
+  return true;
+}
+
+
+bool adcFrozen() {
+
+  unsigned long now = millis();
+
+  for (uint8_t i = 0; i < 4; i++) {
+
+    if (now - lastADCChange[i] >
+        ADC_FREEZE_PERIOD) {
+
+      if (cellVoltage[i] < UNDER_VOLTAGE ||
+          cellVoltage[i] > OVER_VOLTAGE) {
+
+        return true;
+      }
+    }
+  }
+
+  return false;
+}
+
+/* ============================================================
+   TASK 4
+   FAULT LOGGER
+   ============================================================ */
+
+void logFault(
+  FaultType type,
+  const String &message
+) {
+
+  faultLog[faultLogIndex].timestamp = millis();
+  faultLog[faultLogIndex].type = type;
+  faultLog[faultLogIndex].text = message;
+
+  faultLogIndex++;
+
+  if (faultLogIndex >= FAULT_LOG_SIZE) {
+    faultLogIndex = 0;
+  }
+
+  Serial.print("[FAULT] ");
+  Serial.print(millis());
+  Serial.print(" ms | ");
+  Serial.println(message);
+}
+
+/* ============================================================
+   TASK 4
+   EVENT QUEUE
+   ============================================================ */
+
+void queueEvent(const String &message) {
+
+  eventQueue[eventTail].timestamp = millis();
+  eventQueue[eventTail].text = message;
+
+  eventTail =
+    (eventTail + 1) % EVENT_QUEUE_SIZE;
+
+  if (eventCount < EVENT_QUEUE_SIZE) {
+
+    eventCount++;
+  }
+
+  else {
+
+    eventHead =
+      (eventHead + 1) % EVENT_QUEUE_SIZE;
+  }
+}
+
+/* ============================================================
+   TASK 4
+   RUNTIME STATE
+   ============================================================ */
+
+void updateRuntimeState() {
+
+  if (!sensorValid()) {
+
+    runtimeState = RUNTIME_DEGRADED;
+
+    if (activeFault != SENSOR_INVALID_FAULT) {
+
+      activeFault = SENSOR_INVALID_FAULT;
+
+      logFault(
+        SENSOR_INVALID_FAULT,
+        "Invalid sensor reading"
+      );
+
+      queueEvent(
+        "SENSOR INVALID"
+      );
+    }
+
+    return;
+  }
+
+
+  if (adcFrozen()) {
+
+    runtimeState = RUNTIME_DEGRADED;
+
+    if (activeFault != SENSOR_FROZEN_FAULT) {
+
+      activeFault = SENSOR_FROZEN_FAULT;
+
+      logFault(
+        SENSOR_FROZEN_FAULT,
+        "ADC signal frozen"
+      );
+
+      queueEvent(
+        "ADC FROZEN"
+      );
+    }
+
+    return;
+  }
+
+
+  if (batteryHealth == PACK_FAILURE_STATE) {
+
+    runtimeState = RUNTIME_FAILSAFE;
+
+    return;
+  }
+
+
+  if (runtimeState == RUNTIME_DEGRADED) {
+
+    runtimeState = RUNTIME_NORMAL;
+
+    activeFault = NO_FAULT;
+  }
+}
+
+/* ============================================================
+   TASK 2
+   SAFETY FAULT DETECTION
+   ============================================================ */
+
+FaultType detectSafetyFault() {
+
+  if (cellVoltage[weakestCell] < UNDER_VOLTAGE) {
+    return UV_FAULT;
+  }
+
+
+  if (cellVoltage[strongestCell] > OVER_VOLTAGE) {
+    return OV_FAULT;
+  }
+
+
+  for (uint8_t i = 0; i < 4; i++) {
+
+    float dv =
+      fabs(cellVoltage[i] -
+           previousVoltage[i]);
+
+    float dvdt =
+      dv / (SAFETY_PERIOD / 1000.0);
+
+    if (dvdt > MAX_DVDT) {
+      return RAPID_CHANGE_FAULT;
+    }
+  }
+
+  return NO_FAULT;
+}
+
+/* ============================================================
+   TASK 2
+   RELAY CONTROL
+   ============================================================ */
+
+void setRelay(bool state) {
+
+  unsigned long now = millis();
+
+  if (now - lastRelayTransition <
+      RELAY_GUARD_PERIOD) {
+
+    return;
+  }
+
+  relayCommand = state;
+
+  digitalWrite(
+    RELAY_PIN,
+    state ? HIGH : LOW
+  );
+
+  lastRelayTransition = now;
+}
+
+/* ============================================================
+   TASK 2
+   SAFETY FSM
+   ============================================================ */
+
+void updateSafety() {
+
+  FaultType detected =
+    detectSafetyFault();
+
+
+  if (detected != NO_FAULT) {
+
+    if (faultCandidateStart == 0) {
+
+      faultCandidateStart = millis();
+    }
+
+
+    if (millis() -
+        faultCandidateStart >=
+        FAULT_DEBOUNCE) {
+
+      if (activeFault != detected) {
+
+        activeFault = detected;
+
+        logFault(
+          detected,
+          faultString(detected)
+        );
+
+        queueEvent(
+          faultString(detected)
+        );
+      }
+
+      safetyState = SAFETY_FAULT;
+
+      runtimeState = RUNTIME_FAILSAFE;
+
+      setRelay(false);
+    }
+  }
+
+  else {
+
+    faultCandidateStart = 0;
+
+    if (safetyState == SAFETY_FAULT) {
+
+      safetyState = SAFETY_COOLDOWN;
+
+      cooldownStart = millis();
+    }
+  }
+
+
+  if (safetyState == SAFETY_COOLDOWN) {
+
+    if (millis() -
+        cooldownStart >=
+        COOLDOWN_PERIOD) {
+
+      safetyState = SAFETY_NORMAL;
+
+      activeFault = NO_FAULT;
+
+      runtimeState = RUNTIME_NORMAL;
+
+      setRelay(true);
+    }
+  }
+}
+
+/* ============================================================
+   TASK 2
+   BUZZER
+   ============================================================ */
+
+void updateBuzzer() {
+
+  bool alarm =
+    safetyState == SAFETY_FAULT ||
+    runtimeState == RUNTIME_FAILSAFE;
+
+
+  if (!alarm) {
+
+    digitalWrite(BUZZER_PIN, LOW);
+
+    buzzerState = false;
+
+    return;
+  }
+
+
+  if (millis() -
+      lastBuzzerToggle >= 250) {
+
+    lastBuzzerToggle = millis();
+
+    buzzerState = !buzzerState;
+
+    digitalWrite(
+      BUZZER_PIN,
+      buzzerState ? HIGH : LOW
+    );
+  }
+}
+
+/* ============================================================
+   STATUS LEDs
+   ============================================================ */
+
+void updateLEDs() {
+
+  bool red = false;
+  bool yellow = false;
+  bool green = false;
+
+
+  if (runtimeState == RUNTIME_FAILSAFE ||
+      runtimeState == RUNTIME_SHUTDOWN ||
+      batteryHealth == PACK_FAILURE_STATE) {
+
+    red = true;
+  }
+
+  else if (runtimeState == RUNTIME_DEGRADED ||
+           batteryHealth == MINOR_IMBALANCE_STATE ||
+           batteryHealth == CRITICAL_IMBALANCE_STATE) {
+
+    yellow = true;
+  }
+
+  else {
+
+    green = true;
+  }
+
+
+  digitalWrite(RED_LED_PIN, red);
+  digitalWrite(YELLOW_LED_PIN, yellow);
+  digitalWrite(GREEN_LED_PIN, green);
+}
+
+/* ============================================================
+   TASK 4
+   RELAY FEEDBACK
+   ============================================================ */
+
+void checkRelayFeedback() {
+
+  /*
+    The Wokwi button simulates relay feedback.
+
+    LOW = feedback active
+    HIGH = feedback inactive
+
+    For the normal demonstration, keep the button
+    in the state corresponding to the commanded relay.
+  */
+
+  bool feedback =
+    digitalRead(RELAY_FEEDBACK_PIN) == LOW;
+
+
+  /*
+    During the first 500 ms after a relay command,
+    don't declare mismatch.
+  */
+
+  if (millis() -
+      lastRelayTransition < 500) {
+
+    return;
+  }
+
+
+  if (feedback != relayCommand) {
+
+    if (activeFault != RELAY_MISMATCH_FAULT) {
+
+      activeFault =
+        RELAY_MISMATCH_FAULT;
+
+      runtimeState =
+        RUNTIME_FAILSAFE;
+
+      logFault(
+        RELAY_MISMATCH_FAULT,
+        "Relay feedback mismatch"
+      );
+
+      queueEvent(
+        "RELAY MISMATCH"
+      );
+    }
+  }
+}
+
+/* ============================================================
+   TASK 3
+   LCD RENDERING
+   ============================================================ */
+
+String fit16(String text) {
+
+  if (text.length() > 16) {
+    return text.substring(0, 16);
+  }
+
+  while (text.length() < 16) {
+    text += " ";
+  }
+
+  return text;
+}
+
+
+void renderLCD(
+  String line1,
+  String line2
+) {
+
+  line1 = fit16(line1);
+  line2 = fit16(line2);
+
+
+  if (line1 != previousLine1) {
+
+    lcd.setCursor(0, 0);
+    lcd.print(line1);
+
+    previousLine1 = line1;
+  }
+
+
+  if (line2 != previousLine2) {
+
+    lcd.setCursor(0, 1);
+    lcd.print(line2);
+
+    previousLine2 = line2;
+  }
+}
+
+/* ============================================================
+   TASK 3
+   HMI
+   ============================================================ */
+
+void updateHMI() {
+
+  if (activeFault != NO_FAULT) {
+
+    renderLCD(
+      "FAULT:",
+      faultString(activeFault)
+    );
+
+    return;
+  }
+
+
+  switch (currentScreen) {
+
+    case 0:
+
+      renderLCD(
+        "PACK " +
+        String(packVoltage, 2) +
+        "V",
+
+        "SOC " +
+        String(soc) +
+        "% " +
+        healthString()
+      );
+
+      break;
+
+
+    case 1:
+
+      renderLCD(
+        "C1:" +
+        String(cellVoltage[0], 2) +
+        " C2:" +
+        String(cellVoltage[1], 2),
+
+        "W:C" +
+        String(weakestCell + 1) +
+        " S:C" +
+        String(strongestCell + 1)
+      );
+
+      break;
+
+
+    case 2:
+
+      renderLCD(
+        "C3:" +
+        String(cellVoltage[2], 2) +
+        " C4:" +
+        String(cellVoltage[3], 2),
+
+        "dV:" +
+        String(deltaVoltage, 3) +
+        "V"
+      );
+
+      break;
+
+
+    case 3:
+
+      renderLCD(
+        "IMB:" +
+        String(imbalancePercent, 1) +
+        "%",
+
+        "RLY:" +
+        String(relayCommand ? "ON" : "OFF")
+      );
+
+      break;
+  }
+}
+
+/* ============================================================
+   TASK 3
+   SCREEN ROTATION
+   ============================================================ */
+
+void updateScreen() {
+
+  if (millis() -
+      lastScreen >=
+      SCREEN_PERIOD) {
+
+    lastScreen = millis();
+
+    currentScreen++;
+
+    if (currentScreen >= 4) {
+      currentScreen = 0;
+    }
+  }
+}
+
+/* ============================================================
+   TASK 5
+   BLYNK TELEMETRY
+   ============================================================ */
+
+void sendTelemetry() {
+
+  if (!Blynk.connected()) {
+    return;
+  }
+
+
+  Blynk.virtualWrite(V0, cellVoltage[0]);
+  Blynk.virtualWrite(V1, cellVoltage[1]);
+  Blynk.virtualWrite(V2, cellVoltage[2]);
+  Blynk.virtualWrite(V3, cellVoltage[3]);
+
+  Blynk.virtualWrite(V4, packVoltage);
+  Blynk.virtualWrite(V5, soc);
+  Blynk.virtualWrite(V6, imbalancePercent);
+
+  Blynk.virtualWrite(
+    V7,
+    healthString()
+  );
+
+
+  if (WiFi.status() == WL_CONNECTED) {
+
+    Blynk.virtualWrite(
+      V8,
+      WiFi.RSSI()
+    );
+  }
+
+
+  String risk = "LOW";
+
+  if (batteryHealth ==
+      MINOR_IMBALANCE_STATE) {
+
+    risk = "MEDIUM";
+  }
+
+  if (batteryHealth ==
+      CRITICAL_IMBALANCE_STATE) {
+
+    risk = "HIGH";
+  }
+
+  if (batteryHealth ==
+      PACK_FAILURE_STATE) {
+
+    risk = "CRITICAL";
+  }
+
+
+  Blynk.virtualWrite(
+    V10,
+    risk
+  );
+
+
+  String recommendation =
+    "SYSTEM NOMINAL";
+
+
+  if (activeFault == UV_FAULT) {
+
+    recommendation =
+      "STOP - LOW CELL";
+  }
+
+  else if (activeFault == OV_FAULT) {
+
+    recommendation =
+      "STOP - OVERVOLTAGE";
+  }
+
+  else if (imbalancePercent >
+           CRITICAL_IMBALANCE) {
+
+    recommendation =
+      "BALANCE CELLS";
+  }
+
+  else if (imbalancePercent >
+           MINOR_IMBALANCE) {
+
+    recommendation =
+      "MONITOR IMBALANCE";
+  }
+
+  else if (soc < 20) {
+
+    recommendation =
+      "CHARGE SOON";
+  }
+
+
+  Blynk.virtualWrite(
+    V11,
+    recommendation
+  );
+
+
+  Blynk.virtualWrite(
+    V12,
+    "CELL " +
+    String(weakestCell + 1)
+  );
+
+  Blynk.virtualWrite(
+    V13,
+    "CELL " +
+    String(strongestCell + 1)
+  );
+
+
+  bool green =
+    runtimeState ==
+    RUNTIME_NORMAL;
+
+  bool yellow =
+    runtimeState ==
+    RUNTIME_DEGRADED;
+
+  bool red =
+    runtimeState ==
+    RUNTIME_FAILSAFE ||
+    runtimeState ==
+    RUNTIME_SHUTDOWN;
+
+
+  Blynk.virtualWrite(V14, green);
+  Blynk.virtualWrite(V15, yellow);
+  Blynk.virtualWrite(V16, red);
+}
+
+/* ============================================================
+   TASK 5
+   QUEUE FLUSH
+   ============================================================ */
+
+void flushEvents() {
+
+  if (!Blynk.connected()) {
+    return;
+  }
+
+
+  while (eventCount > 0) {
+
+    String eventText =
+      eventQueue[eventHead].text;
+
+
+    Blynk.virtualWrite(
+      V9,
+      eventText
+    );
+
+
+    eventHead =
+      (eventHead + 1) %
+      EVENT_QUEUE_SIZE;
+
+    eventCount--;
+  }
+}
+
+/* ============================================================
+   TASK 5
+   NETWORK
+   ============================================================ */
+
+void networkService() {
+
+  if (WiFi.status() != WL_CONNECTED) {
+
+    if (millis() -
+        lastWiFiAttempt >=
+        WIFI_RETRY_PERIOD) {
+
+      lastWiFiAttempt = millis();
+
+      WiFi.begin(
+        WIFI_SSID,
+        WIFI_PASS
+      );
+    }
+
+    return;
+  }
+
+
+  if (!Blynk.connected()) {
+
+    Blynk.connect(100);
+  }
+
+
+  flushEvents();
+}
+
+/* ============================================================
+   TASK 6
+   HISTORY
+   ============================================================ */
+
+void sendHistory() {
+
+  if (!Blynk.connected()) {
+    return;
+  }
+
+
+  Blynk.virtualWrite(V20, cellVoltage[0]);
+  Blynk.virtualWrite(V21, cellVoltage[1]);
+  Blynk.virtualWrite(V22, cellVoltage[2]);
+  Blynk.virtualWrite(V23, cellVoltage[3]);
+  Blynk.virtualWrite(V24, packVoltage);
+}
+
+/* ============================================================
+   BUTTONS
+   ============================================================ */
+
+void readButtons() {
+
+  static bool previousScreenButton = HIGH;
+  static bool previousFaultButton = HIGH;
+
+
+  bool screenButton =
+    digitalRead(SCREEN_BUTTON_PIN);
+
+  bool faultButton =
+    digitalRead(FAULT_BUTTON_PIN);
+
+
+  if (previousScreenButton == HIGH &&
+      screenButton == LOW) {
+
+    currentScreen++;
+
+    if (currentScreen >= 4) {
+      currentScreen = 0;
+    }
+
+    lastScreen = millis();
+  }
+
+
+  if (previousFaultButton == HIGH &&
+      faultButton == LOW) {
+
+    activeFault =
+      SENSOR_INVALID_FAULT;
+
+    runtimeState =
+      RUNTIME_DEGRADED;
+
+    logFault(
+      SENSOR_INVALID_FAULT,
+      "Manual fault injection"
+    );
+
+    queueEvent(
+      "MANUAL SENSOR FAULT"
+    );
+  }
+
+
+  previousScreenButton =
+    screenButton;
+
+  previousFaultButton =
+    faultButton;
+}
+
+/* ============================================================
+   SETUP
+   ============================================================ */
+
+void setup() {
+
+  Serial.begin(115200);
+
+
+  analogReadResolution(12);
+
+
+  pinMode(
+    BUZZER_PIN,
+    OUTPUT
+  );
+
+  pinMode(
+    RELAY_PIN,
+    OUTPUT
+  );
+
+
+  pinMode(
+    RED_LED_PIN,
+    OUTPUT
+  );
+
+  pinMode(
+    YELLOW_LED_PIN,
+    OUTPUT
+  );
+
+  pinMode(
+    GREEN_LED_PIN,
+    OUTPUT
+  );
+
+
+  pinMode(
+    SCREEN_BUTTON_PIN,
+    INPUT_PULLUP
+  );
+
+  pinMode(
+    FAULT_BUTTON_PIN,
+    INPUT_PULLUP
+  );
+
+  pinMode(
+    RELAY_FEEDBACK_PIN,
+    INPUT_PULLUP
+  );
+
+
+  Wire.begin(21, 22);
+
+
+  lcd.init();
+  lcd.backlight();
+
+
+  lcd.setCursor(0, 0);
+  lcd.print("ESP32 BMS");
+
+  lcd.setCursor(0, 1);
+  lcd.print("INITIALIZING");
+
+
+  /*
+    Start with relay OFF.
+    The normal state will be established by the
+    non-blocking state machine.
+  */
+
+  relayCommand = false;
+
+  digitalWrite(
+    RELAY_PIN,
+    LOW
+  );
+
+
+  for (uint8_t i = 0; i < 4; i++) {
+
+    lastADCChange[i] =
+      millis();
+  }
+
+
+  WiFi.mode(WIFI_STA);
+
+  WiFi.begin(
+    WIFI_SSID,
+    WIFI_PASS
+  );
+
+
+  Blynk.config(
+    BLYNK_AUTH_TOKEN
+  );
+
+
+  /*
+    No delay() here.
+  */
+
+  Serial.println();
+  Serial.println(
+    "================================"
+  );
+
+  Serial.println(
+    " INTEGRATED ESP32 BMS"
+  );
+
+  Serial.println(
+    " SIX TASK SYSTEM"
+  );
+
+  Serial.println(
+    " NON-BLOCKING"
+  );
+
+  Serial.println(
+    "================================"
+  );
+}
+
+/* ============================================================
+   MAIN LOOP
+   ============================================================ */
+
+void loop() {
+
+  unsigned long now =
+    millis();
+
+
+  /*
+    NETWORK
+  */
+
+  networkService();
+
+
+  if (Blynk.connected()) {
+    Blynk.run();
+  }
+
+
+  /*
+    TASK 1
+    Battery intelligence
+  */
+
+  if (now - lastSensor >=
+      SENSOR_PERIOD) {
+
+    lastSensor = now;
+
+    updateBatteryAnalytics();
+  }
+
+
+  /*
+    TASK 2
+    Safety protection
+  */
+
+  if (now - lastSafety >=
+      SAFETY_PERIOD) {
+
+    lastSafety = now;
+
+    updateSafety();
+
+    updateBuzzer();
+  }
+
+
+  /*
+    TASK 4
+    Fault tolerant runtime
+  */
+
+  updateRuntimeState();
+
+  checkRelayFeedback();
+
+
+  /*
+    LEDs
+  */
+
+  updateLEDs();
+
+
+  /*
+    TASK 3
+    HMI
+  */
+
+  if (now - lastHMI >=
+      HMI_PERIOD) {
+
+    lastHMI = now;
+
+    updateScreen();
+
+    updateHMI();
+  }
+
+
+  /*
+    Buttons
+  */
+
+  readButtons();
+
+
+  /*
+    TASK 5
+    Cloud telemetry
+  */
+
+  if (now - lastTelemetry >=
+      TELEMETRY_PERIOD) {
+
+    lastTelemetry = now;
+
+    sendTelemetry();
+  }
+
+
+  /*
+    TASK 6
+    Historical data
+  */
+
+  if (now - lastHistory >=
+      HISTORY_PERIOD) {
+
+    lastHistory = now;
+
+    sendHistory();
+  }
+}
